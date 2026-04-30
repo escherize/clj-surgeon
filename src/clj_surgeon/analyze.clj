@@ -9,7 +9,11 @@
    Form classification (is this a defining form? what's its name? is it
    private?) is delegated to clj-surgeon.forms via a `ctx` map. Public
    functions accept an optional ctx; when omitted, a default is built from
-   the zloc's ns aliases alone (no project config — suffix matchers only)."
+   the zloc's ns aliases alone (no project config — suffix matchers only).
+
+   Reader-conditional aware: top-level walking descends into #?(:clj ...) and
+   #?@(:cljs [...]) branches so that defs inside reader conditionals participate
+   in dependency analysis, topological sort, and extraction."
   (:require [rewrite-clj.zip :as z]
             [rewrite-clj.node :as n]
             [clj-surgeon.forms :as forms]
@@ -33,25 +37,68 @@
 ;; Walk: Collect all top-level forms from a zipper
 ;; ============================================================
 
+(defn- reader-cond? [zloc]
+  (and (= :reader-macro (some-> zloc z/node n/tag))
+       (#{"?" "?@"} (some-> zloc z/down z/string))))
+
+(defn- splicing-rcond? [zloc]
+  (= "?@" (some-> zloc z/down z/string)))
+
+(defn- list-zloc->form-map [zloc ctx]
+  (let [type-str (some-> zloc z/down z/string)
+        name-str (when (forms/defining? type-str ctx)
+                   (forms/extract-name zloc))]
+    {:zloc zloc
+     :node (z/node zloc)
+     :meta (meta (z/node zloc))
+     :type-str type-str
+     :name-str name-str}))
+
+(defn- forms-from-rcond
+  "Yield list-form maps from inside a reader-conditional zloc, descending into
+   each platform branch. For #?(:k FORM) the value-FORM is yielded if it's a
+   list. For #?@(:k [a b c]) every list child of the splice vector is yielded."
+  [rmacro-zloc ctx]
+  (let [splicing (splicing-rcond? rmacro-zloc)
+        pair-list (-> rmacro-zloc z/down z/right)
+        children (->> (z/down pair-list)
+                      (iterate z/right)
+                      (take-while some?))
+        pairs (partition 2 children)]
+    (mapcat (fn [[_k v-zl]]
+              (cond
+                splicing
+                (->> (z/down v-zl)
+                     (iterate z/right)
+                     (take-while some?)
+                     (filter z/list?)
+                     (map #(list-zloc->form-map % ctx)))
+
+                (z/list? v-zl)
+                [(list-zloc->form-map v-zl ctx)]
+
+                :else nil))
+            pairs)))
+
 (defn- top-level-forms
   "Walk a zipper and collect all top-level list forms with metadata.
    Uses the classifier ctx to determine which forms are defining (so callers
-   never see e.g. `(doseq ...)` or `(comment ...)` as candidate forms)."
+   never see e.g. `(doseq ...)` or `(comment ...)` as candidate forms).
+   Descends into reader conditionals so forms inside #?(:clj ...) /
+   #?@(:cljs [...]) participate in dependency analysis."
   [zloc ctx]
   (loop [zloc zloc, forms []]
-    (if (nil? zloc)
-      forms
-      (recur (z/right zloc)
-             (if (z/list? zloc)
-               (let [type-str (some-> zloc z/down z/string)
-                     name-str (when (forms/defining? type-str ctx)
-                                (forms/extract-name zloc))]
-                 (conj forms {:zloc zloc
-                              :node (z/node zloc)
-                              :meta (meta (z/node zloc))
-                              :type-str type-str
-                              :name-str name-str}))
-               forms)))))
+    (cond
+      (nil? zloc) forms
+
+      (reader-cond? zloc)
+      (recur (z/right zloc) (into forms (forms-from-rcond zloc ctx)))
+
+      (z/list? zloc)
+      (recur (z/right zloc) (conj forms (list-zloc->form-map zloc ctx)))
+
+      :else
+      (recur (z/right zloc) forms))))
 
 ;; ============================================================
 ;; Symbols: Extract every symbol referenced within a form's subtree
@@ -111,9 +158,52 @@
 ;; Alias map: Parse a namespace form to get alias → ns mapping
 ;; ============================================================
 
+(defn- extract-alias-from-vector
+  "Extract alias entry from a require vector zloc.
+   [clojure.string :as str] → [\"str\" \"clojure.string\"], or nil."
+  [v]
+  (let [children (->> (z/down v)
+                      (iterate z/right)
+                      (take-while some?)
+                      (map z/string)
+                      vec)
+        as-idx (.indexOf children ":as")]
+    (when (pos? as-idx)
+      [(nth children (inc as-idx)) (first children)])))
+
+(defn- aliases-from-rcond-in-require
+  "Extract alias entries from reader-conditional nodes inside a :require form.
+   Handles both #?(:clj [ns :as a]) and #?@(:cljs [[ns1 :as a] [ns2 :as b]])."
+  [rcond-zloc]
+  (let [splicing (splicing-rcond? rcond-zloc)
+        pair-list (-> rcond-zloc z/down z/right)
+        children (->> (z/down pair-list)
+                      (iterate z/right)
+                      (take-while some?))
+        pairs (partition 2 children)]
+    (mapcat (fn [[_k v-zl]]
+              (cond
+                ;; #?@(:clj [[ns1 :as a] [ns2 :as b]]) — splice: v-zl is a vector of vectors
+                splicing
+                (->> (z/down v-zl)
+                     (iterate z/right)
+                     (take-while some?)
+                     (filter z/vector?)
+                     (keep extract-alias-from-vector))
+
+                ;; #?(:clj [ns :as a]) — single vector
+                (z/vector? v-zl)
+                (when-let [entry (extract-alias-from-vector v-zl)]
+                  [entry])
+
+                :else nil))
+            pairs)))
+
 (defn parse-ns-aliases
   "Parse the (ns ...) form and extract {:alias namespace} map.
-   E.g., (:require [clojure.string :as str]) → {\"str\" clojure.string}"
+   E.g., (:require [clojure.string :as str]) → {\"str\" clojure.string}
+   Reader-conditional-aware: also finds aliases inside #?(:clj [...]) and
+   #?@(:cljs [[...]]) within the :require block."
   [ns-zloc]
   (let [require-form (->> (z/down ns-zloc)
                           (iterate z/right)
@@ -122,22 +212,18 @@
                                         (= ":require" (some-> % z/down z/string))))
                           first)]
     (when require-form
-      (->> (z/down require-form)
-           (iterate z/right)
-           (take-while some?)
-           (filter z/vector?)
-           (map (fn [v]
-                  ;; [clojure.string :as str] → {"str" "clojure.string"}
-                  (let [children (->> (z/down v)
-                                      (iterate z/right)
-                                      (take-while some?)
-                                      (map z/string)
-                                      vec)
-                        as-idx (.indexOf children ":as")]
-                    (when (pos? as-idx)
-                      [(nth children (inc as-idx)) (first children)]))))
-           (filter some?)
-           (into {})))))
+      (let [require-children (->> (z/down require-form)
+                                  (iterate z/right)
+                                  (take-while some?))
+            ;; Direct vector children (shared requires)
+            direct-aliases (->> require-children
+                                (filter z/vector?)
+                                (keep extract-alias-from-vector))
+            ;; Reader-conditional children (platform-specific requires)
+            rcond-aliases (->> require-children
+                               (filter reader-cond?)
+                               (mapcat aliases-from-rcond-in-require))]
+        (into {} (concat direct-aliases rcond-aliases))))))
 
 ;; ============================================================
 ;; Intra-namespace dependency graph

@@ -1,7 +1,11 @@
 (ns clj-surgeon.outline
-  "Parse a Clojure file and return structured outline of all top-level forms."
+  "Parse a Clojure file and return structured outline of all top-level forms.
+   For CLJC files (and any file containing reader conditionals), forms inside
+   #?(:clj ...) / #?@(:cljs [...]) are surfaced too, each tagged with the
+   platforms it applies to."
   (:require [rewrite-clj.zip :as z]
             [clj-surgeon.forms :as forms]
+            [clj-surgeon.cljc.walk :as cwalk]
             [clojure.string :as str]))
 
 (defn- skip-return-schema
@@ -41,6 +45,11 @@
             (recur (dec i) (inc i)) ;; 1-indexed line number
             comment-start))))))
 
+(defn- file-extension [file]
+  (let [s (str file)
+        i (.lastIndexOf s ".")]
+    (when (pos? i) (subs s (inc i)))))
+
 (defn outline
   "Return outline of all top-level forms in a Clojure file.
    Returns EDN map with :ns, :file, :lines, :forms, :forward-refs.
@@ -52,36 +61,42 @@
    - .clj-kondo/config.edn — :lint-as and :hooks/:analyze-call are merged.
                           Macros whose target is a defining form (def, defn,
                           defn-, deftype, ..., def-catch-all) are recognized
-                          via the file's :require aliases and :refer'd names."
+                          via the file's :require aliases and :refer'd names.
+
+   Each form includes :platforms — the set of platforms (#{:clj}, #{:cljs},
+   #{:clj :cljs}, etc.) under which it appears. For .clj/.cljs files this
+   reflects the file extension; for .cljc files it surfaces reader-conditional
+   structure, so a `#?(:clj (defn foo ...))` shows up as a real form with
+   :platforms #{:clj}."
   [file]
   (let [source (slurp file)
         lines (str/split-lines source)
         total-lines (count lines)
         zloc (z/of-string source {:track-position? true})
         ctx (forms/classifier-for-file file zloc)
+        ext (file-extension file)
+        defaults (cwalk/platforms-for-extension ext)
+        walked (cwalk/top-level-forms source defaults)
         forms-acc
-        (loop [zloc zloc, acc []]
-          (if (nil? zloc)
-            acc
-            (let [node (z/node zloc)
-                  m (meta node)]
-              (if (and (z/list? zloc) m)
-                (let [type-str (some-> zloc z/down z/string)
+        (mapv (fn [{:keys [zloc platforms]}]
+                (let [node (z/node zloc)
+                      m (meta node)
+                      type-str (some-> zloc z/down z/string)
                       name-str (when (forms/defining? type-str ctx)
                                  (forms/extract-name zloc))
                       arglist (when name-str (extract-arglist zloc type-str ctx))
                       form-line (:row m)
-                      comment-start (preceding-comments lines form-line)]
-                  (recur (z/right zloc)
-                         (conj acc
-                               (cond-> {:type (symbol (or type-str "?"))
-                                        :line form-line
-                                        :end-line (:end-row m)}
-                                 name-str (assoc :name (symbol name-str))
-                                 arglist (assoc :args arglist)
-                                 (< comment-start form-line)
-                                 (assoc :comment-start comment-start)))))
-                (recur (z/right zloc) acc)))))
+                      comment-start (when form-line
+                                      (preceding-comments lines form-line))]
+                  (cond-> {:type (symbol (or type-str "?"))
+                           :platforms (vec (sort platforms))}
+                    form-line (assoc :line form-line)
+                    (:end-row m) (assoc :end-line (:end-row m))
+                    name-str (assoc :name (symbol name-str))
+                    arglist (assoc :args arglist)
+                    (and form-line comment-start (< comment-start form-line))
+                    (assoc :comment-start comment-start))))
+              walked)
         ns-name (some-> zloc
                         (z/find-value z/next 'ns)
                         z/up
