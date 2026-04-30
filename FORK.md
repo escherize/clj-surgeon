@@ -49,10 +49,11 @@ clj-surgeon :op :topo :file src/metabase/query_processor/pivot.clj
 # (no doseq-binding artifacts; respects mu/defn forms)
 ```
 
-## Caveats
+## Status
 
-- Branch is behind upstream `main` (which added cljc-handling ops). Merge
-  pending — has small conflicts in `outline.clj` and `analyze.clj`.
+Merged with upstream `main` as of the latest push — the classifier and
+upstream's reader-conditional walking compose cleanly. All 133 tests
+(446 assertions) pass.
 
 ## Reverting to upstream
 
