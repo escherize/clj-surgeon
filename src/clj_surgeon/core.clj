@@ -8,6 +8,7 @@
      bb -m ns-surgeon.core :op :mv :file src/my/ns.clj :form my-fn :before other-fn
      bb -m ns-surgeon.core :op :mv :file src/my/ns.clj :form my-fn :before other-fn :dry-run true"
   (:require [clj-surgeon.outline :as outline]
+            [clj-surgeon.forms :as forms]
             [clj-surgeon.forward-refs :as fwd]
             [clj-surgeon.move :as move]
             [clj-surgeon.analyze :as analyze]
@@ -33,7 +34,8 @@
                       (filter #(= 'declare (:type %))))
         ;; Use topo sort to find genuine cycles
         zloc (analyze/file->zloc file)
-        topo (analyze/topological-sort zloc)
+        ctx (forms/classifier-for-file file zloc)
+        topo (analyze/topological-sort zloc ctx)
         truly-cyclic (set (:cycles topo))
         ;; Also check forward-refs to see which declares are still needed
         fwd (when (:ns ol)
@@ -59,22 +61,26 @@
 
 (defn run-deps [{:keys [file form]}]
   (let [zloc (analyze/file->zloc file)
-        deps (analyze/intra-ns-deps zloc)]
+        ctx (forms/classifier-for-file file zloc)
+        deps (analyze/intra-ns-deps zloc ctx)]
     (if form
       (first (filter #(= form (:name %)) deps))
       deps)))
 
 (defn run-topo [{:keys [file]}]
-  (let [zloc (analyze/file->zloc file)]
-    (analyze/topological-sort zloc)))
+  (let [zloc (analyze/file->zloc file)
+        ctx (forms/classifier-for-file file zloc)]
+    (analyze/topological-sort zloc ctx)))
 
 (defn run-closure [{:keys [file form]}]
-  (let [zloc (analyze/file->zloc file)]
-    (analyze/extraction-closure zloc form)))
+  (let [zloc (analyze/file->zloc file)
+        ctx (forms/classifier-for-file file zloc)]
+    (analyze/extraction-closure zloc form ctx)))
 
 (defn run-ls-deps [{:keys [file form]}]
   (let [zloc (analyze/file->zloc file)
-        deps (analyze/intra-ns-deps zloc)]
+        ctx (forms/classifier-for-file file zloc)
+        deps (analyze/intra-ns-deps zloc ctx)]
     (analyze/dep-tree deps form)))
 
 (defn run [{:keys [op] :as opts}]

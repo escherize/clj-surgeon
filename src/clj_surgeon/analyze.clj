@@ -4,9 +4,15 @@
    in a non-homoiconic language.
 
    ALL FUNCTIONS ARE PURE. They take a zipper or parsed forms and return data.
-   No file I/O, no side effects."
+   No file I/O, no side effects.
+
+   Form classification (is this a defining form? what's its name? is it
+   private?) is delegated to clj-surgeon.forms via a `ctx` map. Public
+   functions accept an optional ctx; when omitted, a default is built from
+   the zloc's ns aliases alone (no project config — suffix matchers only)."
   (:require [rewrite-clj.zip :as z]
             [rewrite-clj.node :as n]
+            [clj-surgeon.forms :as forms]
             [clojure.string :as str]))
 
 ;; ============================================================
@@ -28,23 +34,23 @@
 ;; ============================================================
 
 (defn- top-level-forms
-  "Walk a zipper and collect all top-level list forms with metadata."
-  [zloc]
+  "Walk a zipper and collect all top-level list forms with metadata.
+   Uses the classifier ctx to determine which forms are defining (so callers
+   never see e.g. `(doseq ...)` or `(comment ...)` as candidate forms)."
+  [zloc ctx]
   (loop [zloc zloc, forms []]
     (if (nil? zloc)
       forms
       (recur (z/right zloc)
              (if (z/list? zloc)
-               (conj forms {:zloc zloc
-                            :node (z/node zloc)
-                            :meta (meta (z/node zloc))
-                            :type-str (some-> zloc z/down z/string)
-                            :name-str (let [second (some-> zloc z/down z/right)]
-                                        (when second
-                                          ;; Skip metadata nodes (^:private, ^:dynamic, etc.)
-                                          (if (= :meta (some-> second z/node n/tag))
-                                            (some-> second z/down z/rightmost z/string)
-                                            (z/string second))))})
+               (let [type-str (some-> zloc z/down z/string)
+                     name-str (when (forms/defining? type-str ctx)
+                                (forms/extract-name zloc))]
+                 (conj forms {:zloc zloc
+                              :node (z/node zloc)
+                              :meta (meta (z/node zloc))
+                              :type-str type-str
+                              :name-str name-str}))
                forms)))))
 
 ;; ============================================================
@@ -141,20 +147,21 @@
   "For each top-level form, find which OTHER forms in the same namespace
    it references. Returns adjacency list:
    [{:name \"foo\" :depends-on #{\"bar\" \"baz\"}} ...]"
-  [zloc]
-  (let [forms (->> (top-level-forms zloc)
+  ([zloc] (intra-ns-deps zloc (forms/classifier-for-file nil zloc)))
+  ([zloc ctx]
+   (let [tlfs (->> (top-level-forms zloc ctx)
                    (remove #(#{"ns" "declare"} (:type-str %)))) ;; skip ns + declare forms
-        all-names (set (keep :name-str forms))]
-    (->> forms
-         (filter :name-str)
-         (mapv (fn [f]
-                 (let [syms (symbols-in-form (:zloc f))
-                       deps (disj (clojure.set/intersection syms all-names)
-                                  (:name-str f))] ;; don't count self-reference
-                   {:name (:name-str f)
-                    :type (:type-str f)
-                    :line (:row (:meta f))
-                    :depends-on deps}))))))
+         all-names (set (keep :name-str tlfs))]
+     (->> tlfs
+          (filter :name-str)
+          (mapv (fn [f]
+                  (let [syms (symbols-in-form (:zloc f))
+                        deps (disj (clojure.set/intersection syms all-names)
+                                   (:name-str f))] ;; don't count self-reference
+                    {:name (:name-str f)
+                     :type (:type-str f)
+                     :line (:row (:meta f))
+                     :depends-on deps})))))))
 
 ;; ============================================================
 ;; Dead code: forms that nothing else in the namespace references
@@ -163,19 +170,18 @@
 (defn unreferenced-forms
   "Find private forms that are never referenced by any other form
    in the namespace. Candidates for deletion."
-  [zloc]
-  (let [deps (intra-ns-deps zloc)
-        all-referenced (->> deps
-                            (mapcat (comp seq :depends-on))
-                            set)
-        private-types #{"defn-" ">defn-"}]
-    (->> deps
-         (filter (fn [d]
-                   (and (not (contains? all-referenced (:name d)))
-                        ;; Only flag private forms — public might be used externally
-                        (or (contains? private-types (:type d))
-                            (str/starts-with? (or (:type d) "") "defn-")))))
-         (mapv #(select-keys % [:name :type :line])))))
+  ([zloc] (unreferenced-forms zloc (forms/classifier-for-file nil zloc)))
+  ([zloc ctx]
+   (let [deps (intra-ns-deps zloc ctx)
+         all-referenced (->> deps
+                             (mapcat (comp seq :depends-on))
+                             set)]
+     (->> deps
+          (filter (fn [d]
+                    (and (not (contains? all-referenced (:name d)))
+                         ;; Only flag private forms — public might be used externally
+                         (forms/private? (:type d) ctx))))
+          (mapv #(select-keys % [:name :type :line]))))))
 
 ;; ============================================================
 ;; Closure: minimal extractable unit
@@ -187,47 +193,49 @@
    not by anything else in the namespace.
 
    This is the minimal set of forms you'd need to extract together."
-  [zloc target-name]
-  (let [deps (intra-ns-deps zloc)
-        deps-by-name (into {} (map (juxt :name identity) deps))
-        ;; Build reverse deps: who depends on each form?
-        rev-deps (reduce (fn [acc {:keys [name depends-on]}]
-                           (reduce (fn [a dep]
-                                     (update a dep (fnil conj #{}) name))
-                                   acc depends-on))
-                         {} deps)]
-    ;; BFS: start from target, pull in private deps that only this closure uses
-    (loop [queue [target-name]
-           closure #{}
-           visited #{}]
-      (if (empty? queue)
-        (let [closure-deps (filter #(contains? closure (:name %)) deps)]
-          {:target target-name
-           :forms (vec (sort-by :line closure-deps))
-           :total-lines (when (seq closure-deps)
-                          (- (apply max (map #(+ (:line %) 10) closure-deps)) ;; rough estimate
-                             (apply min (map :line closure-deps))))})
-        (let [current (first queue)
-              rest-q (rest queue)]
-          (if (visited current)
-            (recur rest-q closure visited)
-            (let [form (get deps-by-name current)
-                  closure' (conj closure current)
-                  visited' (conj visited current)
-                  ;; Pull in dependencies that are ONLY used by this closure
-                  new-deps (->> (:depends-on form)
-                                (filter (fn [dep]
-                                          (let [callers (get rev-deps dep #{})]
-                                            ;; Include if all callers are already in our closure
-                                            ;; or if it's private (defn-)
-                                            (and (not (visited' dep))
-                                                 (let [dep-form (get deps-by-name dep)]
-                                                   (or (= "defn-" (:type dep-form))
-                                                       (every? closure' callers)))))))
-                                vec)]
-              (recur (into (vec rest-q) new-deps)
-                     closure'
-                     visited'))))))))
+  ([zloc target-name]
+   (extraction-closure zloc target-name (forms/classifier-for-file nil zloc)))
+  ([zloc target-name ctx]
+   (let [deps (intra-ns-deps zloc ctx)
+         deps-by-name (into {} (map (juxt :name identity) deps))
+         ;; Build reverse deps: who depends on each form?
+         rev-deps (reduce (fn [acc {:keys [name depends-on]}]
+                            (reduce (fn [a dep]
+                                      (update a dep (fnil conj #{}) name))
+                                    acc depends-on))
+                          {} deps)]
+     ;; BFS: start from target, pull in private deps that only this closure uses
+     (loop [queue [target-name]
+            closure #{}
+            visited #{}]
+       (if (empty? queue)
+         (let [closure-deps (filter #(contains? closure (:name %)) deps)]
+           {:target target-name
+            :forms (vec (sort-by :line closure-deps))
+            :total-lines (when (seq closure-deps)
+                           (- (apply max (map #(+ (:line %) 10) closure-deps)) ;; rough estimate
+                              (apply min (map :line closure-deps))))})
+         (let [current (first queue)
+               rest-q (rest queue)]
+           (if (visited current)
+             (recur rest-q closure visited)
+             (let [form (get deps-by-name current)
+                   closure' (conj closure current)
+                   visited' (conj visited current)
+                   ;; Pull in dependencies that are ONLY used by this closure
+                   new-deps (->> (:depends-on form)
+                                 (filter (fn [dep]
+                                           (let [callers (get rev-deps dep #{})]
+                                             ;; Include if all callers are already in our closure
+                                             ;; or if it's a private form (defn-, mu/defn-, etc.)
+                                             (and (not (visited' dep))
+                                                  (let [dep-form (get deps-by-name dep)]
+                                                    (or (forms/private? (:type dep-form) ctx)
+                                                        (every? closure' callers)))))))
+                                 vec)]
+               (recur (into (vec rest-q) new-deps)
+                      closure'
+                      visited')))))))))
 
 ;; ============================================================
 ;; Dependency tree: transitive deps as a tree structure
@@ -277,8 +285,9 @@
   "Topologically sort forms so each form appears AFTER its dependencies.
    This is the order that eliminates forward references.
    Returns {:sorted [...] :cycles [...]}. Cycles need (declare)."
-  [zloc]
-  (let [deps (intra-ns-deps zloc)
+  ([zloc] (topological-sort zloc (forms/classifier-for-file nil zloc)))
+  ([zloc ctx]
+  (let [deps (intra-ns-deps zloc ctx)
         ;; dep-count: how many intra-ns deps does each form have?
         dep-count (into {} (map (fn [d] [(:name d) (count (:depends-on d))]) deps))
         ;; reverse-adj: form -> list of forms that depend on it
@@ -310,4 +319,4 @@
           (recur (into rest-q new-ready)
                  (conj sorted node)
                  dcnt'
-                 remaining'))))))
+                 remaining')))))))
