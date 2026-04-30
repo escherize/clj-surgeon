@@ -51,9 +51,6 @@ clj-surgeon :op :topo :file src/metabase/query_processor/pivot.clj
 
 ## Caveats
 
-- Tests at the time of the fork: 65 / 239 passing. The branch is functional
-  on Metabase but the test suite has regressions from the refactor — fixes
-  are in flight before the upstream PR.
 - Branch is behind upstream `main` (which added cljc-handling ops). Merge
   pending — has small conflicts in `outline.clj` and `analyze.clj`.
 
